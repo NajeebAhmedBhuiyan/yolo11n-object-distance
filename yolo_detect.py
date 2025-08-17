@@ -3,13 +3,13 @@ import sys
 import argparse
 import glob
 import time
+import math
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 # Define and parse user input arguments
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', help='Path to YOLO model file (example: "runs/detect/train/weights/best.pt")',
                     required=True)
@@ -17,7 +17,7 @@ parser.add_argument('--source', help='Image source, can be image file ("test.jpg
                     image folder ("test_dir"), video file ("testvid.mp4"), or index of USB camera ("usb0")', 
                     required=True)
 parser.add_argument('--thresh', help='Minimum confidence threshold for displaying detected objects (example: "0.4")',
-                    default=0.5)
+                    type=float, default=0.5)
 parser.add_argument('--resolution', help='Resolution in WxH to display inference results at (example: "640x480"), \
                     otherwise, match source resolution',
                     default=None)
@@ -58,21 +58,38 @@ elif os.path.isfile(img_source):
     else:
         print(f'File extension {ext} is not supported.')
         sys.exit(0)
-elif 'usb' in img_source:
+elif img_source.lower().startswith('usb'):
     source_type = 'usb'
-    usb_idx = int(img_source[3:])
+    try:
+        usb_idx = int(img_source[3:])
+    except Exception:
+        print('Invalid usb index. Use format usb0, usb1, etc.')
+        sys.exit(0)
+elif img_source.lower().isdigit():  # allow camera index like "0"
+    source_type = 'usb'
+    usb_idx = int(img_source)
 elif 'picamera' in img_source:
     source_type = 'picamera'
-    picam_idx = int(img_source[8:])
+    try:
+        picam_idx = int(img_source[8:])
+    except Exception:
+        picam_idx = 0
 else:
     print(f'Input {img_source} is invalid. Please try again.')
     sys.exit(0)
 
-# Parse user-specified display resolution
+# Parse user-specified display resolution safely
 resize = False
 if user_res:
-    resize = True
-    resW, resH = int(user_res.split('x')[0]), int(user_res.split('x')[1])
+    try:
+        parts = user_res.lower().split('x')
+        if len(parts) != 2:
+            raise ValueError
+        resW, resH = int(parts[0]), int(parts[1])
+        resize = True
+    except Exception:
+        print('Invalid --resolution format. Use WIDTHxHEIGHT (e.g. 640x480).')
+        sys.exit(1)
 
 # Check if recording is valid and set up recording
 if record:
@@ -106,8 +123,8 @@ elif source_type == 'video' or source_type == 'usb':
 
     # Set camera or video resolution if specified by user
     if user_res:
-        ret = cap.set(3, resW)
-        ret = cap.set(4, resH)
+        _ = cap.set(3, resW)
+        _ = cap.set(4, resH)
 
 elif source_type == 'picamera':
     from picamera2 import Picamera2
@@ -163,6 +180,7 @@ while True:
         frame = cv2.resize(frame,(resW,resH))
 
     # Run inference on frame
+    # Note: we keep using the model call as you had it; we manually threshold detections below using min_thresh
     results = model(frame, verbose=False)
 
     # Extract results
@@ -180,27 +198,78 @@ while True:
         xyxy = xyxy_tensor.numpy().squeeze() # Convert tensors to Numpy array
         xmin, ymin, xmax, ymax = xyxy.astype(int) # Extract individual coordinates and convert to int
 
+        # Correct possible coordinate ordering issues
+        xmin, xmax = min(xmin, xmax), max(xmin, xmax)
+        ymin, ymax = min(ymin, ymax), max(ymin, ymax)
+
         # Get bounding box class ID and name
         classidx = int(detections[i].cls.item())
         classname = labels[classidx]
 
         # Get bounding box confidence
-        conf = detections[i].conf.item()
+        conf = float(detections[i].conf.item())
 
         # Draw box if confidence threshold is high enough
-        if conf > 0.5:
+        if conf > min_thresh:
 
             color = bbox_colors[classidx % 10]
             cv2.rectangle(frame, (xmin,ymin), (xmax,ymax), color, 2)
 
+            # Label text (class + confidence)
             label = f'{classname}: {int(conf*100)}%'
-            labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1) # Get font size
-            label_ymin = max(ymin, labelSize[1] + 10) # Make sure not to draw label too close to top of window
-            cv2.rectangle(frame, (xmin, label_ymin-labelSize[1]-10), (xmin+labelSize[0], label_ymin+baseLine-10), color, cv2.FILLED) # Draw white box to put label text in
-            cv2.putText(frame, label, (xmin, label_ymin-7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1) # Draw label text
+            labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            label_ymin = max(ymin, labelSize[1] + 10)
+            cv2.rectangle(frame, (xmin, label_ymin-labelSize[1]-10), (xmin+labelSize[0], label_ymin+baseLine-10), color, cv2.FILLED)
+            cv2.putText(frame, label, (xmin, label_ymin-7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
             # Basic example: count the number of objects in the image
             object_count = object_count + 1
+
+            # -------------------------
+            # NEW: compute diagonal length (in pixels) and draw it at lower-right corner of bbox
+            # -------------------------
+            box_w = float(xmax - xmin)
+            box_h = float(ymax - ymin)
+            diag_px = math.sqrt(box_w**2 + box_h**2)
+
+            # Prepare diagonal label text
+            diag_label = f'{diag_px:.1f}px'  # show one decimal place
+
+            # Get text size for diagonal label
+            diag_size, diag_base = cv2.getTextSize(diag_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            diag_w, diag_h = diag_size
+
+            # Compute top-left corner of background rectangle so the label appears at lower-right of bbox
+            # We'll draw the label inside the bbox near the bottom-right corner if possible; otherwise shift it left/up
+            padding = 6
+            # default positioning: align right edge of text with bbox right edge, and text bottom with bbox bottom
+            tx1 = xmax - diag_w - padding
+            ty1 = ymax - diag_h - padding
+            tx2 = xmax
+            ty2 = ymax
+
+            # ensure the rectangle stays within image and doesn't overlap badly with bbox edges
+            img_h, img_w = frame.shape[:2]
+            if tx1 < 0:
+                tx1 = max(0, xmin)  # push inside bbox or to image edge
+                tx2 = tx1 + diag_w + padding
+            if ty1 < 0:
+                ty1 = max(0, ymin)
+                ty2 = ty1 + diag_h + padding
+            if tx2 > img_w:
+                tx2 = img_w
+                tx1 = max(0, tx2 - diag_w - padding)
+            if ty2 > img_h:
+                ty2 = img_h
+                ty1 = max(0, ty2 - diag_h - padding)
+
+            # Draw filled rectangle as background for the diag label (same color as bbox)
+            cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), color, cv2.FILLED)
+
+            # Put diagonal text (we position text inside that rectangle)
+            text_x = tx1 + 2
+            text_y = ty2 - 2  # small bottom padding
+            cv2.putText(frame, diag_label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
 
     # Calculate and draw framerate (if using video, USB, or Picamera source)
     if source_type == 'video' or source_type == 'usb' or source_type == 'picamera':
@@ -226,7 +295,9 @@ while True:
     
     # Calculate FPS for this frame
     t_stop = time.perf_counter()
-    frame_rate_calc = float(1/(t_stop - t_start))
+    # protect against division by zero just in case
+    frame_time = max(1e-6, (t_stop - t_start))
+    frame_rate_calc = float(1.0 / frame_time)
 
     # Append FPS result to frame_rate_buffer (for finding average FPS over multiple frames)
     if len(frame_rate_buffer) >= fps_avg_len:
