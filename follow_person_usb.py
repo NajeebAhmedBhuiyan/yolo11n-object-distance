@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """
-follow_person_usb.py
+follow_person_usb_handshake.py
 
-Detect a person with ultralytics YOLO on RPi5 camera and send single-byte
-commands to an Arduino Nano over USB serial to keep the person centered & at a
-target distance.
-
-Commands:
-  'L' - turn left
-  'R' - turn right
-  'F' - step forward
-  'B' - step back
-  'X' - stop / stand
+Use this on the RPi5 with a webcam. Detect person (YOLO) and send single-byte motion
+commands to an Arduino over USB, using a handshake: Pi sends one command, Arduino
+executes and then replies "DONE". Pi waits for DONE before sending the next command.
 
 Usage:
-  python3 follow_person_usb.py --model path/to/best.pt --source 0 --resolution 640x480
-  Optional: --serial /dev/ttyACM0 to override auto-detection
+  I'll give it later
 """
 
 import argparse
@@ -37,25 +29,25 @@ except Exception:
     print("pyserial missing. Install: pip3 install pyserial")
     serial = None
 
-# ---------- Defaults you can tune ----------
+# -------- CONFIG (tune these) --------
 SERIAL_BAUD = 9600
 FRAME_BUFFER = 5
 CONFIRM_FRAMES = 3
-CMD_INTERVAL = 0.18
+ACK_TIMEOUT = 3.0           # seconds to wait for Arduino "DONE"
 H_CENTER_DEADZONE = 0.08
 HYSTERESIS = 0.02
 TARGET_DIAG = 220.0
 DIAG_TOLERANCE = 0.12
 VERBOSE = True
 
-# ---------- helpers ----------
+# -------- helpers ----------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--model', required=True, help='Path to YOLO model file (e.g. runs/detect/train/weights/best.pt)')
-    p.add_argument('--source', required=True, help='camera index (0) or video file')
+    p.add_argument('--model', required=True)
+    p.add_argument('--source', required=True)
     p.add_argument('--resolution', default='640x480')
     p.add_argument('--thresh', type=float, default=0.5)
-    p.add_argument('--serial', default=None, help='Serial port (e.g. /dev/ttyACM0). If omitted script tries to auto-find.')
+    p.add_argument('--serial', default=None, help='Serial path (e.g. /dev/ttyACM0). If omitted auto-detect.')
     return p.parse_args()
 
 def find_person_class_indices(labels):
@@ -74,11 +66,10 @@ def find_person_class_indices(labels):
     return person_idxs
 
 def auto_find_serial():
-    # try common serial device names
     candidates = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*') + glob.glob('/dev/serial/by-id/*')
     if not candidates:
         return None
-    # prefer /dev/ttyACM0 if present
+    # prefer ACM
     for c in candidates:
         if os.path.basename(c).startswith('ttyACM'):
             return c
@@ -92,8 +83,7 @@ def open_serial(port, baud):
         s = serial.Serial(port, baud, timeout=0.1)
         time.sleep(0.2)
         if VERBOSE:
-            print("[SERIAL] Opened", port)
-        # flush any startup bytes
+            print(f"[SERIAL] Opened {port} @ {baud}")
         s.reset_input_buffer()
         s.reset_output_buffer()
         return s
@@ -111,76 +101,74 @@ def send_cmd(ser, ch):
         print("Serial write failed:", e)
         return False
 
-# ---------- main ----------
+# -------- main ----------
 def main():
     args = parse_args()
 
-    # resolution
+    # resolution parsing
     try:
         w,h = args.resolution.lower().split('x')
         resW, resH = int(w), int(h)
     except:
-        print("Invalid resolution format (use WIDTHxHEIGHT).")
+        print("Invalid resolution. Use WIDTHxHEIGHT")
         return
 
-    # model exists?
+    # model
     if not os.path.exists(args.model):
         print("Model file not found:", args.model)
         return
-
     model = YOLO(args.model, task='detect')
     labels = model.names
     person_class_idxs = find_person_class_indices(labels)
     if not person_class_idxs:
+        print("Warning: person class not found; assuming 0")
         person_class_idxs.add(0)
-        print("Warning: person class not found in model names; assuming index 0")
 
-    # open serial port
-    serial_port = args.serial
-    if serial_port is None:
-        serial_port = auto_find_serial()
-        if serial_port:
-            print("Auto-detected serial device:", serial_port)
-        else:
-            print("No serial device auto-detected. Use --serial to set path (e.g. /dev/ttyACM0).")
-    ser = None
+    # serial
+    serial_port = args.serial or auto_find_serial()
     if serial_port:
-        ser = open_serial(serial_port, SERIAL_BAUD)
+        print("Using serial port:", serial_port)
+    else:
+        print("No serial port auto-detected. Use --serial to set device.")
+    ser = open_serial(serial_port, SERIAL_BAUD) if serial_port else None
 
-    # open camera
+    # camera
     source = int(args.source) if args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        print("Failed to open camera/source:", source)
+        print("Failed to open camera/source", source)
         if ser: ser.close()
         return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, resW)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resH)
 
-    # buffers & state
+    # buffers and state
     errx_buf = collections.deque(maxlen=FRAME_BUFFER)
     diag_buf = collections.deque(maxlen=FRAME_BUFFER)
     stable_h_count = 0
-    last_cmd_time = 0
-    last_sent_cmd = None
     no_person_frames = 0
     MAX_NO_PERSON_BEFORE_STOP = 10
 
-    print("Starting loop. Press 'q' in the window to stop.")
+    awaiting_ack = False
+    ack_deadline = 0.0
+    last_cmd_time = 0.0
+
+    print("Starting loop. Press 'q' to quit window. Waiting for target...")
 
     while True:
-        start = time.time()
+        t0 = time.time()
         ret, frame = cap.read()
         if not ret:
-            print("Camera read failed.")
+            print("Camera read error.")
             break
         img_h, img_w = frame.shape[:2]
 
+        # YOLO inference
         results = model(frame, verbose=False)
         res = results[0]
         boxes = res.boxes
-        chosen = None
 
+        chosen = None
         if boxes is not None and len(boxes) > 0:
             try:
                 xyxy_all = boxes.xyxy.cpu().numpy()
@@ -193,53 +181,63 @@ def main():
 
             candidates = []
             for (xyxy, conf, classidx) in zip(xyxy_all, confs, clss):
-                if int(classidx) not in person_class_idxs:
-                    continue
-                if float(conf) <= args.thresh:
-                    continue
+                if int(classidx) not in person_class_idxs: continue
+                if float(conf) <= args.thresh: continue
                 xmin, ymin, xmax, ymax = [int(round(x)) for x in xyxy]
-                xmin = max(0, min(xmin, img_w - 1))
-                xmax = max(0, min(xmax, img_w - 1))
-                ymin = max(0, min(ymin, img_h - 1))
-                ymax = max(0, min(ymax, img_h - 1))
-                cx = int((xmin + xmax) / 2)
-                cy = int((ymin + ymax) / 2)
+                xmin = max(0, min(xmin, img_w-1))
+                xmax = max(0, min(xmax, img_w-1))
+                ymin = max(0, min(ymin, img_h-1))
+                ymax = max(0, min(ymax, img_h-1))
+                cx = int((xmin + xmax)/2)
+                cy = int((ymin + ymax)/2)
                 box_w = float(xmax - xmin)
                 box_h = float(ymax - ymin)
                 diag_px = math.sqrt(box_w**2 + box_h**2)
                 candidates.append((cx, cy, diag_px, float(conf), xmin, ymin, xmax, ymax))
+
             if candidates:
-                chosen = max(candidates, key=lambda x: x[2])
+                chosen = max(candidates, key=lambda x: x[2])  # closest (largest diag)
 
         if chosen is None:
             no_person_frames += 1
             if no_person_frames >= MAX_NO_PERSON_BEFORE_STOP:
-                # send stop (X)
-                now = time.time()
-                if ser and (now - last_cmd_time) >= CMD_INTERVAL:
-                    if last_sent_cmd != 'X':
-                        if send_cmd(ser, 'X'):
-                            last_sent_cmd = 'X'
-                            last_cmd_time = now
-                            if VERBOSE:
-                                print("[CMD] No person - Sent X")
-            cv2.putText(frame, "No person", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+                # try to stop robot if not already doing so
+                if ser and not awaiting_ack:
+                    send_cmd(ser, 'X')
+                    awaiting_ack = True
+                    ack_deadline = time.time() + ACK_TIMEOUT
+                    if VERBOSE: print("[CMD] No person -> Sent X, awaiting DONE")
+            cv2.putText(frame, "No person", (10,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
             cv2.imshow('Follow', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+            # poll serial for DONE while no person
+            if ser and awaiting_ack:
+                try:
+                    line = ser.readline().decode(errors='ignore').strip()
+                    if line:
+                        if VERBOSE: print("[SER RX]", repr(line))
+                        if line == 'DONE':
+                            awaiting_ack = False
+                except Exception:
+                    pass
+                if awaiting_ack and time.time() > ack_deadline:
+                    print("[SERIAL] Ack timeout while no-person; clearing awaiting_ack")
+                    awaiting_ack = False
             continue
         else:
             no_person_frames = 0
 
         cx, cy, diag_px, conf, xmin, ymin, xmax, ymax = chosen
+
+        # overlays
         color = (0,200,0)
         cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-        cv2.putText(frame, f'person {int(conf*100)}% diag:{diag_px:.1f}', (xmin, max(0, ymin-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(frame, f'person {int(conf*100)}% diag:{diag_px:.1f}', (xmin, max(0,ymin-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+        # error metrics
         half_w = img_w / 2.0
-        errx = (cx - half_w) / half_w   # -1..1
-
-        # smoothing
+        errx = (cx - half_w) / half_w    # normalized -1..1
         errx_buf.append(errx)
         diag_buf.append(diag_px)
         errx_med = float(np.median(list(errx_buf)))
@@ -276,7 +274,7 @@ def main():
         else:
             distance_cmd = None
 
-        # choose final command
+        # final choice: prioritize centering
         chosen_cmd = None
         if horizontal_cmd is not None and stable_h_count >= CONFIRM_FRAMES:
             chosen_cmd = horizontal_cmd
@@ -285,18 +283,45 @@ def main():
         else:
             chosen_cmd = None  # waiting for confirm frames
 
+        # --- HANDSHAKE logic: send one command at a time and wait for DONE ---
         now = time.time()
-        if chosen_cmd is not None and ser is not None:
-            if (now - last_cmd_time) >= CMD_INTERVAL:
-                if chosen_cmd != last_sent_cmd:
-                    ok = send_cmd(ser, chosen_cmd)
-                    if ok:
-                        last_sent_cmd = chosen_cmd
-                        last_cmd_time = now
-                        if VERBOSE:
-                            print(f"[CMD] Sent {chosen_cmd} errx_med={errx_med:.3f} diag_med={diag_med:.1f}")
 
-        status = f'err_med={errx_med:+.3f} diag_med={diag_med:.1f} cmd={chosen_cmd}'
+        # If not awaiting ack and we have a command to send, send it
+        if not awaiting_ack and chosen_cmd is not None and ser is not None:
+            # send command
+            try:
+                # clear old input to reduce stale lines
+                ser.reset_input_buffer()
+                ser.write(chosen_cmd.encode('ascii'))
+                awaiting_ack = True
+                ack_deadline = now + ACK_TIMEOUT
+                if VERBOSE:
+                    print(f"[SERIAL TX] Sent '{chosen_cmd}', awaiting DONE")
+            except Exception as e:
+                print("Serial write error:", e)
+                awaiting_ack = False
+
+        # If awaiting ack, poll serial for responses (non-blocking)
+        if ser is not None and awaiting_ack:
+            try:
+                line = ser.readline().decode(errors='ignore').strip()
+                if line:
+                    if VERBOSE:
+                        print("[SERIAL RX]", repr(line))
+                    # Arduino sends "DONE" after finishing motion
+                    if line == 'DONE':
+                        awaiting_ack = False
+                        # allow immediate next send on next loop iteration
+            except Exception:
+                pass
+
+            # ack timeout guard
+            if awaiting_ack and time.time() > ack_deadline:
+                print("[SERIAL] ACK timeout, clearing awaiting_ack")
+                awaiting_ack = False
+
+        # overlays and debug info
+        status = f'err_med={errx_med:+.3f} diag_med={diag_med:.1f} cmd={chosen_cmd} awaiting_ack={awaiting_ack}'
         cv2.putText(frame, status, (10, img_h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
         cv2.imshow('Follow', frame)
 
@@ -306,9 +331,11 @@ def main():
         elif key == ord('p'):
             cv2.imwrite('capture_follow.png', frame)
 
+    # cleanup
     cap.release()
     cv2.destroyAllWindows()
-    if ser: ser.close()
+    if ser:
+        ser.close()
     print("Exiting.")
 
 if __name__ == '__main__':

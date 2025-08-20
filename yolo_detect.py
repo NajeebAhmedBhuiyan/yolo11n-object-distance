@@ -1,57 +1,41 @@
 #!/usr/bin/env python3
-"""
-follow_person_usb.py
-
-Use this on the RPi5 with a webcam. Detect person (YOLO) and send single-byte motion
-commands to an Arduino over USB, using a handshake: Pi sends one command, Arduino
-executes and then replies "DONE". Pi waits for DONE before sending the next command.
-
-Usage:
-I'll give it soon don't worry!
-
-"""
-
-import argparse
-import math
-import time
-import collections
 import os
 import sys
+import argparse
 import glob
+import time
+import math
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Serial (pyserial)
-try:
-    import serial
-except Exception:
-    print("pyserial missing. Install: pip3 install pyserial")
-    serial = None
-
-# -------- CONFIG (tune these) --------
-SERIAL_BAUD = 9600
-FRAME_BUFFER = 5
-CONFIRM_FRAMES = 3
-ACK_TIMEOUT = 3.0           # seconds to wait for Arduino "DONE"
-H_CENTER_DEADZONE = 0.08
-HYSTERESIS = 0.02
-TARGET_DIAG = 220.0
-DIAG_TOLERANCE = 0.12
-VERBOSE = True
-
-# -------- helpers ----------
+# -----------------------
+# arg parsing & helpers
+# -----------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--model', required=True)
-    p.add_argument('--source', required=True)
-    p.add_argument('--resolution', default='640x480')
-    p.add_argument('--thresh', type=float, default=0.5)
-    p.add_argument('--serial', default=None, help='Serial path (e.g. /dev/ttyACM0). If omitted auto-detect.')
+    p.add_argument('--model', required=True, help='Path to YOLO model file (e.g. runs/detect/train/weights/best.pt)')
+    p.add_argument('--source', required=True, help='Image, folder, video file, camera index (0) or "usb0", or "picamera"')
+    p.add_argument('--thresh', type=float, default=0.5, help='Display confidence threshold (default 0.5)')
+    p.add_argument('--resolution', default=None, help='Display/record resolution as WIDTHxHEIGHT (e.g. 640x480)')
+    p.add_argument('--record', action='store_true', help='Record output to demo1.avi (requires --resolution)')
     return p.parse_args()
 
+def safe_int(v, default=0):
+    try:
+        return int(v)
+    except:
+        return default
+
+def is_image_ext(ext):
+    return ext.lower() in ('.jpg','.jpeg','.png','.bmp')
+
+def is_video_ext(ext):
+    return ext.lower() in ('.avi','.mov','.mp4','.mkv','.wmv')
+
 def find_person_class_indices(labels):
+    """Return a set of class indices corresponding to 'person' label (case-insensitive)."""
     person_idxs = set()
     if isinstance(labels, dict):
         for k, v in labels.items():
@@ -66,110 +50,177 @@ def find_person_class_indices(labels):
                 person_idxs.add(i)
     return person_idxs
 
-def auto_find_serial():
-    candidates = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*') + glob.glob('/dev/serial/by-id/*')
-    if not candidates:
-        return None
-    # prefer ACM
-    for c in candidates:
-        if os.path.basename(c).startswith('ttyACM'):
-            return c
-    return candidates[0]
-
-def open_serial(port, baud):
-    if serial is None:
-        print("pyserial not installed.")
-        return None
-    try:
-        s = serial.Serial(port, baud, timeout=0.1)
-        time.sleep(0.2)
-        if VERBOSE:
-            print(f"[SERIAL] Opened {port} @ {baud}")
-        s.reset_input_buffer()
-        s.reset_output_buffer()
-        return s
-    except Exception as e:
-        print("[SERIAL] Failed to open", port, e)
-        return None
-
-def send_cmd(ser, ch):
-    if ser is None:
-        return False
-    try:
-        ser.write(ch.encode('ascii'))
-        return True
-    except Exception as e:
-        print("Serial write failed:", e)
-        return False
-
-# -------- main ----------
+# -----------------------
+# main
+# -----------------------
 def main():
     args = parse_args()
+    model_path = args.model
+    img_source = args.source
+    min_thresh = args.thresh
+    user_res = args.resolution
+    record = args.record
 
-    # resolution parsing
-    try:
-        w,h = args.resolution.lower().split('x')
-        resW, resH = int(w), int(h)
-    except:
-        print("Invalid resolution. Use WIDTHxHEIGHT")
-        return
+    if not os.path.exists(model_path):
+        print('ERROR: Model path not found:', model_path)
+        sys.exit(1)
 
-    # model
-    if not os.path.exists(args.model):
-        print("Model file not found:", args.model)
-        return
-    model = YOLO(args.model, task='detect')
+    model = YOLO(model_path, task='detect')
     labels = model.names
     person_class_idxs = find_person_class_indices(labels)
-    if not person_class_idxs:
-        print("Warning: person class not found; assuming 0")
+    if len(person_class_idxs) == 0:
+        print('Warning: "person" label not found in model names. Falling back to class index 0 (COCO typical).')
         person_class_idxs.add(0)
 
-    # serial
-    serial_port = args.serial or auto_find_serial()
-    if serial_port:
-        print("Using serial port:", serial_port)
+    # decide source type
+    source_type = None
+    usb_idx = None
+    picam_idx = None
+    if os.path.isdir(img_source):
+        source_type = 'folder'
+    elif os.path.isfile(img_source):
+        _, ext = os.path.splitext(img_source)
+        if is_image_ext(ext):
+            source_type = 'image'
+        elif is_video_ext(ext):
+            source_type = 'video'
+        else:
+            print(f'Unsupported file extension: {ext}')
+            sys.exit(1)
+    elif img_source.lower().startswith('usb'):
+        source_type = 'usb'
+        usb_idx = safe_int(img_source[3:], 0)
+    elif img_source.isdigit():
+        source_type = 'usb'
+        usb_idx = int(img_source)
+    elif 'picamera' in img_source.lower():
+        source_type = 'picamera'
+        try:
+            picam_idx = int(img_source.lower().replace('picamera','') or 0)
+        except:
+            picam_idx = 0
     else:
-        print("No serial port auto-detected. Use --serial to set device.")
-    ser = open_serial(serial_port, SERIAL_BAUD) if serial_port else None
+        print('Invalid --source value. Use image, folder, video file, camera index, usb0, or picamera.')
+        sys.exit(1)
 
-    # camera
-    source = int(args.source) if args.source.isdigit() else args.source
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        print("Failed to open camera/source", source)
-        if ser: ser.close()
-        return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, resW)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resH)
+    # parse resolution
+    resize = False
+    resW = resH = None
+    if user_res:
+        try:
+            parts = user_res.lower().split('x')
+            if len(parts) != 2:
+                raise ValueError
+            resW, resH = int(parts[0]), int(parts[1])
+            resize = True
+        except Exception:
+            print('Invalid --resolution. Use WIDTHxHEIGHT like 640x480.')
+            sys.exit(1)
 
-    # buffers and state
-    errx_buf = collections.deque(maxlen=FRAME_BUFFER)
-    diag_buf = collections.deque(maxlen=FRAME_BUFFER)
-    stable_h_count = 0
-    no_person_frames = 0
-    MAX_NO_PERSON_BEFORE_STOP = 10
+    recorder = None
+    if record:
+        if source_type not in ('video','usb'):
+            print('Recording only valid for video or camera sources.')
+            sys.exit(1)
+        if not resize:
+            print('Please specify --resolution to record.')
+            sys.exit(1)
+        record_name = 'demo1.avi'
+        record_fps = 30
+        recorder = cv2.VideoWriter(record_name, cv2.VideoWriter_fourcc(*'MJPG'), record_fps, (resW, resH))
 
-    awaiting_ack = False
-    ack_deadline = 0.0
-    last_cmd_time = 0.0
+    # prepare source
+    imgs_list = []
+    cap = None
+    if source_type == 'image':
+        imgs_list = [img_source]
+    elif source_type == 'folder':
+        all_files = sorted(glob.glob(os.path.join(img_source, '*')))
+        for f in all_files:
+            _, ext = os.path.splitext(f)
+            if is_image_ext(ext):
+                imgs_list.append(f)
+        if len(imgs_list) == 0:
+            print('No images found in folder.')
+            sys.exit(1)
+    elif source_type in ('video','usb'):
+        cap_arg = img_source if source_type == 'video' else (usb_idx if usb_idx is not None else 0)
+        cap = cv2.VideoCapture(cap_arg)
+        if not cap.isOpened():
+            print('ERROR: Unable to open video/camera:', cap_arg)
+            sys.exit(1)
+        if resize:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, resW)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resH)
+    elif source_type == 'picamera':
+        try:
+            from picamera2 import Picamera2
+            cap = Picamera2()
+            if resize:
+                cap.configure(cap.create_video_configuration(main={"format": 'XRGB8888', "size": (resW, resH)}))
+            else:
+                cap.configure(cap.create_video_configuration(main={"format": 'XRGB8888', "size": (640, 480)}))
+            cap.start()
+        except Exception as e:
+            print('Picamera2 not available or failed to start:', e)
+            sys.exit(1)
 
-    print("Starting loop. Press 'q' to quit window. Waiting for target...")
+    bbox_colors = [(164,120,87), (68,148,228), (93,97,209), (178,182,133), (88,159,106),
+                   (96,202,231), (159,124,168), (169,162,241), (98,118,150), (172,176,184)]
+
+    fps_buffer = []
+    fps_avg_len = 200
+    img_count = 0
+
+    # fonts & scales
+    PERSON_LABEL_FONT_SCALE = 0.5
+    POS_LABEL_FONT_SCALE = 0.45
+    DIAG_LABEL_FONT_SCALE = 0.5
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
 
     while True:
-        t0 = time.time()
-        ret, frame = cap.read()
-        if not ret:
-            print("Camera read error.")
-            break
-        img_h, img_w = frame.shape[:2]
+        t_start = time.perf_counter()
 
-        # YOLO inference
+        if source_type in ('image','folder'):
+            if img_count >= len(imgs_list):
+                print('All images processed. Exiting.')
+                break
+            frame = cv2.imread(imgs_list[img_count])
+            if frame is None:
+                print('Failed to read image:', imgs_list[img_count])
+                img_count += 1
+                continue
+            img_count += 1
+
+        elif source_type == 'video':
+            ret, frame = cap.read()
+            if not ret:
+                print('End of video reached.')
+                break
+
+        elif source_type == 'usb':
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print('Camera read failed; exiting.')
+                break
+
+        elif source_type == 'picamera':
+            frame_bgra = cap.capture_array()
+            frame = cv2.cvtColor(np.copy(frame_bgra), cv2.COLOR_BGRA2BGR)
+            if frame is None:
+                print('Picamera read failed; exiting.')
+                break
+
+        if resize and frame is not None:
+            frame = cv2.resize(frame, (resW, resH))
+
+        # inference
         results = model(frame, verbose=False)
         res = results[0]
         boxes = res.boxes
+        object_count = 0
+        img_h, img_w = frame.shape[:2]
 
-        chosen = None
         if boxes is not None and len(boxes) > 0:
             try:
                 xyxy_all = boxes.xyxy.cpu().numpy()
@@ -180,164 +231,185 @@ def main():
                 confs = np.array(boxes.conf)
                 clss = np.array(boxes.cls).astype(int)
 
-            candidates = []
             for (xyxy, conf, classidx) in zip(xyxy_all, confs, clss):
-                if int(classidx) not in person_class_idxs: continue
-                if float(conf) <= args.thresh: continue
+                if int(classidx) not in person_class_idxs:
+                    continue
+                if float(conf) <= min_thresh:
+                    continue
+
                 xmin, ymin, xmax, ymax = [int(round(x)) for x in xyxy]
-                xmin = max(0, min(xmin, img_w-1))
-                xmax = max(0, min(xmax, img_w-1))
-                ymin = max(0, min(ymin, img_h-1))
-                ymax = max(0, min(ymax, img_h-1))
-                cx = int((xmin + xmax)/2)
-                cy = int((ymin + ymax)/2)
+                xmin, xmax = max(0, min(xmin, img_w-1)), max(0, min(xmax, img_w-1))
+                ymin, ymax = max(0, min(ymin, img_h-1)), max(0, min(ymax, img_h-1))
+
+                color = bbox_colors[classidx % len(bbox_colors)]
+
+                # draw bbox
+                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+
+                # 1) top-left label (class + conf)
+                person_label = f'person: {int(conf*100)}%'
+                pl_size, pl_base = cv2.getTextSize(person_label, FONT, PERSON_LABEL_FONT_SCALE, 1)
+                pl_w, pl_h = pl_size
+                pl_x1 = xmin
+                pl_y1 = max(ymin, pl_h + 8)
+                cv2.rectangle(frame, (pl_x1, pl_y1 - pl_h - 6), (pl_x1 + pl_w, pl_y1 + pl_base - 6), color, cv2.FILLED)
+                cv2.putText(frame, person_label, (pl_x1, pl_y1 - 2), FONT, PERSON_LABEL_FONT_SCALE, (0,0,0), 1)
+
+                # compute center & normalized pos
+                cx = int((xmin + xmax) / 2)
+                cy = int((ymin + ymax) / 2)
+                nx = cx / float(img_w)
+                ny = cy / float(img_h)
+                pos_label = f'({cx},{cy}) {nx:.0%},{ny:.0%}'
+
+                # pos label (top-right of bbox)
+                pos_size, pos_base = cv2.getTextSize(pos_label, FONT, POS_LABEL_FONT_SCALE, 1)
+                pos_w, pos_h = pos_size
+                padding = 6
+
+                pos_px2 = xmax  # right edge align
+                pos_py1 = ymin  # top align
+                pos_px1 = pos_px2 - pos_w - padding
+                pos_py2 = pos_py1 + pos_h + padding
+
+                # clamp inside image
+                if pos_px1 < 0:
+                    pos_px1 = max(0, xmin)
+                    pos_px2 = pos_px1 + pos_w + padding
+                if pos_py1 < 0:
+                    pos_py1 = 0
+                    pos_py2 = pos_py1 + pos_h + padding
+                if pos_px2 > img_w:
+                    pos_px2 = img_w
+                    pos_px1 = max(0, pos_px2 - pos_w - padding)
+                if pos_py2 > img_h:
+                    pos_py2 = img_h
+                    pos_py1 = max(0, pos_py2 - pos_h - padding)
+
+                pos_rect = (int(pos_px1), int(pos_py1), int(pos_px2), int(pos_py2))
+
+                # 2) diag label (bottom-right of bbox) - keep one decimal place
                 box_w = float(xmax - xmin)
                 box_h = float(ymax - ymin)
                 diag_px = math.sqrt(box_w**2 + box_h**2)
-                candidates.append((cx, cy, diag_px, float(conf), xmin, ymin, xmax, ymax))
+                diag_label = f'{diag_px:.1f}px'
+                diag_size, diag_base = cv2.getTextSize(diag_label, FONT, DIAG_LABEL_FONT_SCALE, 1)
+                diag_w, diag_h = diag_size
 
-            if candidates:
-                chosen = max(candidates, key=lambda x: x[2])  # closest (largest diag)
+                diag_px2 = xmax
+                diag_py2 = ymax
+                diag_px1 = diag_px2 - diag_w - padding
+                diag_py1 = diag_py2 - diag_h - padding
 
-        if chosen is None:
-            no_person_frames += 1
-            if no_person_frames >= MAX_NO_PERSON_BEFORE_STOP:
-                # try to stop robot if not already doing so
-                if ser and not awaiting_ack:
-                    send_cmd(ser, 'X')
-                    awaiting_ack = True
-                    ack_deadline = time.time() + ACK_TIMEOUT
-                    if VERBOSE: print("[CMD] No person -> Sent X, awaiting DONE")
-            cv2.putText(frame, "No person", (10,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-            cv2.imshow('Follow', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            # poll serial for DONE while no person
-            if ser and awaiting_ack:
-                try:
-                    line = ser.readline().decode(errors='ignore').strip()
-                    if line:
-                        if VERBOSE: print("[SER RX]", repr(line))
-                        if line == 'DONE':
-                            awaiting_ack = False
-                except Exception:
-                    pass
-                if awaiting_ack and time.time() > ack_deadline:
-                    print("[SERIAL] Ack timeout while no-person; clearing awaiting_ack")
-                    awaiting_ack = False
-            continue
-        else:
-            no_person_frames = 0
+                # clamp inside image
+                if diag_px1 < 0:
+                    diag_px1 = max(0, xmin)
+                    diag_px2 = diag_px1 + diag_w + padding
+                if diag_py1 < 0:
+                    diag_py1 = max(0, ymin)
+                    diag_py2 = diag_py1 + diag_h + padding
+                if diag_px2 > img_w:
+                    diag_px2 = img_w
+                    diag_px1 = max(0, diag_px2 - diag_w - padding)
+                if diag_py2 > img_h:
+                    diag_py2 = img_h
+                    diag_py1 = max(0, diag_py2 - diag_h - padding)
 
-        cx, cy, diag_px, conf, xmin, ymin, xmax, ymax = chosen
+                diag_rect = (int(diag_px1), int(diag_py1), int(diag_px2), int(diag_py2))
+
+                # If pos_rect and diag_rect intersect inside the bbox, attempt to move one:
+                def rects_intersect(r1, r2):
+                    x11,y11,x12,y12 = r1
+                    x21,y21,x22,y22 = r2
+                    return not (x12 <= x21 or x22 <= x11 or y12 <= y21 or y22 <= y11)
+
+                # Try resolving overlap: prefer keeping pos at top-right; move diag above bbox if possible.
+                if rects_intersect(pos_rect, diag_rect):
+                    # try move diag above bbox (y_top = ymin - diag_h - padding*2)
+                    new_diag_py2 = ymin - 2  # just above bbox
+                    new_diag_py1 = new_diag_py2 - diag_h - padding
+                    if new_diag_py1 >= 0:
+                        diag_py1 = int(new_diag_py1)
+                        diag_py2 = int(new_diag_py2)
+                        diag_px1 = int(max(0, diag_px2 - diag_w - padding))
+                        diag_rect = (diag_px1, diag_py1, diag_px2, diag_py2)
+                    else:
+                        # else try moving pos label above bbox
+                        new_pos_py2 = ymin - 2
+                        new_pos_py1 = new_pos_py2 - pos_h - padding
+                        if new_pos_py1 >= 0:
+                            pos_py1 = int(new_pos_py1)
+                            pos_py2 = int(new_pos_py2)
+                            pos_px1 = int(max(0, pos_px2 - pos_w - padding))
+                            pos_rect = (pos_px1, pos_py1, pos_px2, pos_py2)
+                        else:
+                            # as last resort, nudge diag left inside bbox
+                            diag_px1 = int(max(xmin, diag_px1 - (pos_w + padding)))
+                            diag_px2 = int(diag_px1 + diag_w + padding)
+                            diag_rect = (diag_px1, diag_py1, diag_px2, diag_py2)
+
+                # draw pos rect and text
+                rect_tl = (int(pos_rect[0]), int(pos_rect[1]))
+                rect_br = (int(pos_rect[2]), int(pos_rect[3]))
+                cv2.rectangle(frame, rect_tl, rect_br, color, cv2.FILLED)
+                text_x = rect_tl[0] + 2
+                text_y = rect_br[1] - 4
+                cv2.putText(frame, pos_label, (text_x, text_y), FONT, POS_LABEL_FONT_SCALE, (0,0,0), 1)
+
+                # draw diag rect and text
+                d_tl = (int(diag_rect[0]), int(diag_rect[1]))
+                d_br = (int(diag_rect[2]), int(diag_rect[3]))
+                cv2.rectangle(frame, d_tl, d_br, color, cv2.FILLED)
+                d_text_x = d_tl[0] + 2
+                d_text_y = d_br[1] - 4
+                cv2.putText(frame, diag_label, (d_text_x, d_text_y), FONT, DIAG_LABEL_FONT_SCALE, (0,0,0), 1)
+
+                object_count += 1
+
+        # FPS calculation
+        t_stop = time.perf_counter()
+        frame_time = max(1e-6, t_stop - t_start)
+        fps = 1.0 / frame_time
+        if len(fps_buffer) >= fps_avg_len:
+            fps_buffer.pop(0)
+        fps_buffer.append(fps)
+        avg_fps = float(np.mean(fps_buffer)) if fps_buffer else 0.0
 
         # overlays
-        color = (0,200,0)
-        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-        cv2.putText(frame, f'person {int(conf*100)}% diag:{diag_px:.1f}', (xmin, max(0,ymin-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        if source_type in ('video','usb','picamera'):
+            cv2.putText(frame, f'FPS: {avg_fps:0.2f}', (10,20), FONT, .7, (0,255,255), 2)
+        cv2.putText(frame, f'Persons: {object_count}', (10,40), FONT, .7, (0,255,255), 2)
 
-        # error metrics
-        half_w = img_w / 2.0
-        errx = (cx - half_w) / half_w    # normalized -1..1
-        errx_buf.append(errx)
-        diag_buf.append(diag_px)
-        errx_med = float(np.median(list(errx_buf)))
-        diag_med = float(np.median(list(diag_buf)))
+        cv2.imshow('YOLO person-only', frame)
+        if recorder is not None:
+            recorder.write(frame)
 
-        # thresholds
-        dead = H_CENTER_DEADZONE
-        enter_left = -dead - HYSTERESIS
-        enter_right = dead + HYSTERESIS
-
-        diag_low = TARGET_DIAG * (1.0 - DIAG_TOLERANCE)
-        diag_high = TARGET_DIAG * (1.0 + DIAG_TOLERANCE)
-
-        # horizontal decision
-        horizontal_cmd = None
-        if errx_med <= enter_left:
-            horizontal_cmd = 'L'
-        elif errx_med >= enter_right:
-            horizontal_cmd = 'R'
+        # key handling
+        if source_type in ('image','folder'):
+            key = cv2.waitKey(0) & 0xFF
         else:
-            horizontal_cmd = None
+            key = cv2.waitKey(5) & 0xFF
 
-        if horizontal_cmd is None:
-            stable_h_count = 0
-        else:
-            stable_h_count += 1
-
-        # distance decision
-        distance_cmd = None
-        if diag_med < diag_low:
-            distance_cmd = 'F'
-        elif diag_med > diag_high:
-            distance_cmd = 'B'
-        else:
-            distance_cmd = None
-
-        # final choice: prioritize centering
-        chosen_cmd = None
-        if horizontal_cmd is not None and stable_h_count >= CONFIRM_FRAMES:
-            chosen_cmd = horizontal_cmd
-        elif horizontal_cmd is None:
-            chosen_cmd = distance_cmd if distance_cmd is not None else 'X'
-        else:
-            chosen_cmd = None  # waiting for confirm frames
-
-        # --- HANDSHAKE logic: send one command at a time and wait for DONE ---
-        now = time.time()
-
-        # If not awaiting ack and we have a command to send, send it
-        if not awaiting_ack and chosen_cmd is not None and ser is not None:
-            # send command
-            try:
-                # clear old input to reduce stale lines
-                ser.reset_input_buffer()
-                ser.write(chosen_cmd.encode('ascii'))
-                awaiting_ack = True
-                ack_deadline = now + ACK_TIMEOUT
-                if VERBOSE:
-                    print(f"[SERIAL TX] Sent '{chosen_cmd}', awaiting DONE")
-            except Exception as e:
-                print("Serial write error:", e)
-                awaiting_ack = False
-
-        # If awaiting ack, poll serial for responses (non-blocking)
-        if ser is not None and awaiting_ack:
-            try:
-                line = ser.readline().decode(errors='ignore').strip()
-                if line:
-                    if VERBOSE:
-                        print("[SERIAL RX]", repr(line))
-                    # Arduino sends "DONE" after finishing motion
-                    if line == 'DONE':
-                        awaiting_ack = False
-                        # allow immediate next send on next loop iteration
-            except Exception:
-                pass
-
-            # ack timeout guard
-            if awaiting_ack and time.time() > ack_deadline:
-                print("[SERIAL] ACK timeout, clearing awaiting_ack")
-                awaiting_ack = False
-
-        # overlays and debug info
-        status = f'err_med={errx_med:+.3f} diag_med={diag_med:.1f} cmd={chosen_cmd} awaiting_ack={awaiting_ack}'
-        cv2.putText(frame, status, (10, img_h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-        cv2.imshow('Follow', frame)
-
-        key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        elif key == ord('s'):
+            cv2.waitKey(0)  # pause
         elif key == ord('p'):
-            cv2.imwrite('capture_follow.png', frame)
+            cv2.imwrite('capture.png', frame)
+            print('Saved capture.png')
 
-    # cleanup
-    cap.release()
+    print(f'Average pipeline FPS: {avg_fps:.2f}')
+    if cap is not None:
+        if source_type == 'picamera':
+            try:
+                cap.stop()
+            except:
+                pass
+        else:
+            cap.release()
+    if recorder is not None:
+        recorder.release()
     cv2.destroyAllWindows()
-    if ser:
-        ser.close()
-    print("Exiting.")
 
 if __name__ == '__main__':
     main()
